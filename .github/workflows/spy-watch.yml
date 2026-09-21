@@ -1,0 +1,40 @@
+name: SPY drop watcher
+
+on:
+  schedule:
+    # Every 5 minutes. This UTC window (13:00-21:00) covers US market hours
+    # (9:30am-4:00pm ET) across both EDT and EST, so it stays correct
+    # through the DST change in November without editing this file — the
+    # script itself checks the real Eastern time and skips outside 9:30-4:00.
+    - cron: "*/5 13-21 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab to test
+
+permissions:
+  contents: write   # needed so the workflow can commit history.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run SPY watcher
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: python spy_watch.py
+
+      - name: Persist price history
+        run: |
+          git config user.name "spy-watch-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add history.json
+          git diff --cached --quiet || git commit -m "Update SPY price history [skip ci]"
+          git push

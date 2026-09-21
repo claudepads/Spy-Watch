@@ -135,4 +135,58 @@ def send_alert_email(subject: str, body: str):
     if resp.status_code >= 300:
         print(f"ERROR sending email: {resp.status_code} {resp.text}")
     else:
-        print(f"Alert email sent to
+        print(f"Alert email sent to {ALERT_EMAIL_TO}")
+
+
+def main():
+    now = now_eastern()
+    if not is_market_open(now):
+        print(f"CLOSED {now.isoformat()} — outside trading hours, skipping.")
+        return
+
+    try:
+        price = fetch_price()
+    except Exception as exc:
+        print(f"ERROR fetching price: {exc}")
+        sys.exit(1)
+
+    history = load_history()
+    history.append({"ts": now, "price": price})
+    cutoff = now - timedelta(minutes=PRUNE_AFTER_MINUTES)
+    history = [h for h in history if h["ts"] >= cutoff]
+    save_history(history)
+
+    high_10, high_10_ts = high_in_window(history, now, RULE_10MIN_MINUTES)
+    high_30, high_30_ts = high_in_window(history, now, RULE_30MIN_MINUTES)
+
+    if high_10 is not None:
+        drop_10 = high_10 - price
+        if drop_10 >= RULE_10MIN_DROP:
+            print(f"ALERT_10MIN current={price:.2f} high={high_10:.2f} drop={drop_10:.2f}")
+            send_alert_email(
+                f"\U0001F53B SPY dropped ${drop_10:.2f} in ~10 minutes",
+                f"SPY dropped ${drop_10:.2f} in the last ~10 minutes: "
+                f"from ${high_10:.2f} at {high_10_ts.strftime('%I:%M:%S %p %Z')} "
+                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
+                f"This breaches your 75-cent-in-10-minutes threshold.",
+            )
+            return
+
+    if high_30 is not None:
+        drop_30 = high_30 - price
+        if drop_30 >= RULE_30MIN_DROP:
+            print(f"ALERT_30MIN current={price:.2f} high={high_30:.2f} drop={drop_30:.2f}")
+            send_alert_email(
+                f"\U0001F53B SPY dropped ${drop_30:.2f} in ~30 minutes",
+                f"SPY dropped ${drop_30:.2f} in the last ~30 minutes: "
+                f"from ${high_30:.2f} at {high_30_ts.strftime('%I:%M:%S %p %Z')} "
+                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
+                f"This breaches your $1-in-30-minutes threshold.",
+            )
+            return
+
+    print(f"OK current={price:.2f} high10={high_10} high30={high_30} — no threshold breached.")
+
+
+if __name__ == "__main__":
+    main()

@@ -2,15 +2,22 @@ name: SPY drop watcher
 
 on:
   schedule:
-    # Every 5 minutes. This UTC window (13:00-21:00) covers US market hours
-    # (9:30am-4:00pm ET) across both EDT and EST, so it stays correct
-    # through the DST change in November without editing this file — the
-    # script itself checks the real Eastern time and skips outside 9:30-4:00.
+    # Every 5 minutes (GitHub's shortest supported schedule interval). This
+    # UTC window (13:00-21:00) covers US market hours (9:30am-4:00pm ET)
+    # across both EDT and EST, so it stays correct through the DST change
+    # in November without editing this file — the script itself checks the
+    # real Eastern time and skips outside 9:30-4:00. Within each 5-minute
+    # run, the script polls the price roughly once a minute (see
+    # spy_watch.py) to get finer resolution than the 5-minute schedule.
     - cron: "*/5 13-21 * * 1-5"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab to test
 
 permissions:
   contents: write   # needed so the workflow can commit history.json back to the repo
+
+concurrency:
+  group: spy-watch
+  cancel-in-progress: false   # queue runs instead of overlapping (each run now takes a few minutes)
 
 jobs:
   check:
@@ -37,4 +44,17 @@ jobs:
           git config user.email "actions@users.noreply.github.com"
           git add history.json
           git diff --cached --quiet || git commit -m "Update SPY price history [skip ci]"
-          git push
+          # GitHub's servers occasionally return a transient 500 on push
+          # (nothing to do with this repo or code) — retry a few times
+          # with a short backoff instead of failing the whole run.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "push attempt $attempt failed, retrying in 10s..."
+            git fetch origin main
+            git rebase origin/main || git rebase --abort
+            sleep 10
+          done
+          echo "push failed after 5 attempts"
+          exit 1

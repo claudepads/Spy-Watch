@@ -2,19 +2,28 @@
 """
 SPY drop watcher — designed to run every 5 minutes as a GitHub Actions
 scheduled workflow (Claude's own scheduler has a 1-hour minimum interval,
-which can't catch a fast 10/30-minute move, so this runs on GitHub instead).
+which can't catch a fast few-minute move, so this runs on GitHub instead).
+
+GitHub Actions' schedule itself can't fire more often than every 5 minutes,
+so to get finer resolution than that, each 5-minute run POLLS the price
+several times internally (once a minute, for a few minutes) before exiting,
+rather than taking just one snapshot. Combined with history persisted
+across runs (committed back to the repo each time — GitHub Actions runners
+are otherwise ephemeral), this gives roughly 1-minute price resolution,
+which is what makes short rolling windows like "4 minutes" meaningful.
 
 Each run:
   1. Skips entirely (no API calls) unless it's currently a weekday between
      9:30am and 4:00pm US/Eastern.
-  2. Fetches SPY's current quote from Finnhub.
-  3. Appends it to history.json (committed back to the repo each run so
-     history survives between runs — GitHub Actions runners are ephemeral).
-  4. Checks the rolling history for:
-       - a drop of >= $0.75 within the trailing 10 minutes
-       - a drop of >= $1.00 within the trailing 30 minutes
+  2. Otherwise, polls SPY's current quote from Finnhub every POLL_INTERVAL_SECONDS
+     for POLL_ITERATIONS samples (a few minutes total, comfortably inside the
+     5-minute gap before the next scheduled run).
+  3. After each sample, checks the rolling history for:
+       - a drop of >= RULE_FAST_DROP within the trailing RULE_FAST_MINUTES
+       - a drop of >= RULE_SLOW_DROP within the trailing RULE_SLOW_MINUTES
      ("drop" = highest recorded price in that window minus the current price)
-  5. If either rule fires, emails the alert via Resend.
+     and emails the alert via Resend the moment either one fires, then stops
+     polling for this run (the next scheduled run resumes monitoring).
 
 Required environment variables (set as GitHub Actions secrets):
   FINNHUB_API_KEY   - free key from finnhub.io
@@ -30,6 +39,7 @@ Optional:
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -48,14 +58,18 @@ SYMBOL = "SPY"
 MARKET_OPEN = (9, 30)
 MARKET_CLOSE = (16, 0)
 
-RULE_10MIN_MINUTES = 10
-RULE_10MIN_DROP = 0.75
-RULE_30MIN_MINUTES = 30
-RULE_30MIN_DROP = 1.00
+RULE_FAST_MINUTES = 4
+RULE_FAST_DROP = 0.75
+RULE_SLOW_MINUTES = 9
+RULE_SLOW_DROP = 1.00
+
+# How this run polls within its 5-minute slot before the next scheduled run.
+POLL_INTERVAL_SECONDS = 60
+POLL_ITERATIONS = 4  # samples at t=0, 60, 120, 180s -> ~3 minutes, leaving buffer
 
 # Keep a little slack past the longest window so we always have enough
-# history to evaluate the 30-minute rule.
-PRUNE_AFTER_MINUTES = 40
+# history to evaluate the slower rule even right after a run starts.
+PRUNE_AFTER_MINUTES = 20
 
 ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "ericp@dcicon.ca")
 ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "onboarding@resend.dev")
@@ -138,54 +152,69 @@ def send_alert_email(subject: str, body: str):
         print(f"Alert email sent to {ALERT_EMAIL_TO}")
 
 
+def check_once(history):
+    """Fetch one price sample, update history, evaluate both rules.
+
+    Returns True if an alert fired (caller should stop polling), False otherwise.
+    """
+    now = now_eastern()
+    try:
+        price = fetch_price()
+    except Exception as exc:
+        print(f"ERROR fetching price: {exc}")
+        return False
+
+    history.append({"ts": now, "price": price})
+    cutoff = now - timedelta(minutes=PRUNE_AFTER_MINUTES)
+    history[:] = [h for h in history if h["ts"] >= cutoff]
+    save_history(history)
+
+    high_fast, high_fast_ts = high_in_window(history, now, RULE_FAST_MINUTES)
+    high_slow, high_slow_ts = high_in_window(history, now, RULE_SLOW_MINUTES)
+
+    if high_fast is not None:
+        drop_fast = high_fast - price
+        if drop_fast >= RULE_FAST_DROP:
+            print(f"ALERT_FAST current={price:.2f} high={high_fast:.2f} drop={drop_fast:.2f}")
+            send_alert_email(
+                f"\U0001F53B SPY dropped ${drop_fast:.2f} in ~{RULE_FAST_MINUTES} minutes",
+                f"SPY dropped ${drop_fast:.2f} in the last ~{RULE_FAST_MINUTES} minutes: "
+                f"from ${high_fast:.2f} at {high_fast_ts.strftime('%I:%M:%S %p %Z')} "
+                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
+                f"This breaches your ${RULE_FAST_DROP:.2f}-in-{RULE_FAST_MINUTES}-minutes threshold.",
+            )
+            return True
+
+    if high_slow is not None:
+        drop_slow = high_slow - price
+        if drop_slow >= RULE_SLOW_DROP:
+            print(f"ALERT_SLOW current={price:.2f} high={high_slow:.2f} drop={drop_slow:.2f}")
+            send_alert_email(
+                f"\U0001F53B SPY dropped ${drop_slow:.2f} in ~{RULE_SLOW_MINUTES} minutes",
+                f"SPY dropped ${drop_slow:.2f} in the last ~{RULE_SLOW_MINUTES} minutes: "
+                f"from ${high_slow:.2f} at {high_slow_ts.strftime('%I:%M:%S %p %Z')} "
+                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
+                f"This breaches your ${RULE_SLOW_DROP:.2f}-in-{RULE_SLOW_MINUTES}-minutes threshold.",
+            )
+            return True
+
+    print(f"OK current={price:.2f} highFast={high_fast} highSlow={high_slow} — no threshold breached.")
+    return False
+
+
 def main():
     now = now_eastern()
     if not is_market_open(now):
         print(f"CLOSED {now.isoformat()} — outside trading hours, skipping.")
         return
 
-    try:
-        price = fetch_price()
-    except Exception as exc:
-        print(f"ERROR fetching price: {exc}")
-        sys.exit(1)
-
     history = load_history()
-    history.append({"ts": now, "price": price})
-    cutoff = now - timedelta(minutes=PRUNE_AFTER_MINUTES)
-    history = [h for h in history if h["ts"] >= cutoff]
-    save_history(history)
-
-    high_10, high_10_ts = high_in_window(history, now, RULE_10MIN_MINUTES)
-    high_30, high_30_ts = high_in_window(history, now, RULE_30MIN_MINUTES)
-
-    if high_10 is not None:
-        drop_10 = high_10 - price
-        if drop_10 >= RULE_10MIN_DROP:
-            print(f"ALERT_10MIN current={price:.2f} high={high_10:.2f} drop={drop_10:.2f}")
-            send_alert_email(
-                f"\U0001F53B SPY dropped ${drop_10:.2f} in ~10 minutes",
-                f"SPY dropped ${drop_10:.2f} in the last ~10 minutes: "
-                f"from ${high_10:.2f} at {high_10_ts.strftime('%I:%M:%S %p %Z')} "
-                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
-                f"This breaches your 75-cent-in-10-minutes threshold.",
-            )
-            return
-
-    if high_30 is not None:
-        drop_30 = high_30 - price
-        if drop_30 >= RULE_30MIN_DROP:
-            print(f"ALERT_30MIN current={price:.2f} high={high_30:.2f} drop={drop_30:.2f}")
-            send_alert_email(
-                f"\U0001F53B SPY dropped ${drop_30:.2f} in ~30 minutes",
-                f"SPY dropped ${drop_30:.2f} in the last ~30 minutes: "
-                f"from ${high_30:.2f} at {high_30_ts.strftime('%I:%M:%S %p %Z')} "
-                f"down to ${price:.2f} just now ({now.strftime('%I:%M:%S %p %Z')}).\n\n"
-                f"This breaches your $1-in-30-minutes threshold.",
-            )
-            return
-
-    print(f"OK current={price:.2f} high10={high_10} high30={high_30} — no threshold breached.")
+    for i in range(POLL_ITERATIONS):
+        alerted = check_once(history)
+        if alerted:
+            break
+        if i < POLL_ITERATIONS - 1:
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":

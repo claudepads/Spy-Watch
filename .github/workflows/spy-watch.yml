@@ -2,14 +2,15 @@ name: SPY drop watcher
 
 on:
   schedule:
-    # Every 5 minutes (GitHub's shortest supported schedule interval). This
+    # Every 5 minutes (GitHub's shortest supported schedule interval), offset
+    # to :02, :07, :12... to avoid GitHub's busiest minutes (:00/:05). This
     # UTC window (13:00-21:00) covers US market hours (9:30am-4:00pm ET)
     # across both EDT and EST, so it stays correct through the DST change
     # in November without editing this file — the script itself checks the
     # real Eastern time and skips outside 9:30-4:00. Within each 5-minute
     # run, the script polls the price roughly once a minute (see
     # spy_watch.py) to get finer resolution than the 5-minute schedule.
-    - cron: "*/5 13-21 * * 1-5"
+    - cron: "2-59/5 13-21 * * 1-5"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab to test
 
 permissions:
@@ -21,7 +22,8 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # pinned so the ubuntu-latest -> Ubuntu 26 switch doesn't change anything
+    timeout-minutes: 10     # kill a hung run so it can't block later runs for hours
     steps:
       - uses: actions/checkout@v4
 
